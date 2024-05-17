@@ -48,6 +48,21 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
+
+    /// delete_area
+    pub fn delete_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let index = self.
+            areas.
+            iter().
+            position(|area| area.vpn_range.contains_all(VPNRange::new(start_va.floor().into(), end_va.ceil().into())));
+        if let Some(index) = index {
+            self.areas[index].unmap(&mut self.page_table);
+            self.areas.remove(index);
+            return 0;
+        }
+        -1
+        // self.areas.remove(index)
+    }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
         &mut self,
@@ -82,23 +97,6 @@ impl MemorySet {
         }
         self.areas.push(map_area);
     }
-    
-    /// 在内存集中清空映射区域
-    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
-        // 遍历所有映射区域
-        let mut index = 0;
-        while index < self.areas.len() {
-            let area = &mut self.areas[index];
-            if area.vpn_range.get_start() == start_va.floor() && area.vpn_range.get_end() == end_va.ceil() {
-                area.unmap(&mut self.page_table); // 解除映射
-                self.areas.remove(index); // 移除映射区域
-                return 0;
-            }
-            index += 1;
-        }
-        return -1;
-    }
-
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -251,19 +249,15 @@ impl MemorySet {
         )
     }
     /// Create a new address space by copy code&data from a exited process's address space.
-    /// 复制一个完全相同的地址空间
     pub fn from_existed_user(user_space: &Self) -> Self {
-        // 创建一个空的地址空间
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
-            // 逻辑段复制
             let new_area = MapArea::from_another(area);
             memory_set.push(new_area, None);
             // copy data from another space
-            // 数据复制
             for vpn in area.vpn_range {
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
@@ -322,14 +316,20 @@ impl MemorySet {
         }
     }
 
-    /// 检测新的映射区域是否与已有的映射区域冲突
-    pub fn check_conflict(&self, start: VirtAddr, end: VirtAddr) -> bool {
-        // any: 如果任意一个元素满足条件，则返回true
-        self.areas.iter().any(|area| {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            (start.floor() >= area_start && start.floor() < area_end) || (end.ceil() > area_start && end.ceil() <= area_end)
-        })
+    /// 区间内有一部分虚存已映射
+    pub fn exist_some_range(&mut self, vpn_range: VPNRange) -> Option<&mut MapArea> {
+        self
+            .areas
+            .iter_mut()
+            .find(|area| area.vpn_range.contains(vpn_range))
+    }
+
+    /// 区间内有全部虚存已映射
+    pub fn exist_all_range(&mut self, vpn_range: VPNRange)-> Option<&mut MapArea>{
+        self
+            .areas
+            .iter_mut()
+            .find(|area| area.vpn_range.contains_all(vpn_range))
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory
@@ -356,8 +356,6 @@ impl MapArea {
             map_perm,
         }
     }
-    /// 可以从一个逻辑段复制得到一个虚拟地址区间、映射方式和权限控制均相同的逻辑段
-    /// 由于它还没有真正被映射到物理页帧上，所以 data_frames 字段为空
     pub fn from_another(another: &Self) -> Self {
         Self {
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
@@ -366,7 +364,6 @@ impl MapArea {
             map_perm: another.map_perm,
         }
     }
-
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -382,14 +379,17 @@ impl MapArea {
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
-
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
     }
+    //将 MapArea 实例映射到给定的页表 page_table 中
+    /// 它们的实现是遍历逻辑段中的所有虚拟页面，
+        /// 并以每个虚拟页面为单位依次在多级页表中进行键值对的插入或删除
     pub fn map(&mut self, page_table: &mut PageTable) {
+        
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
@@ -415,6 +415,10 @@ impl MapArea {
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
+    /// 将切片 data 中的数据拷贝到当前逻辑段实际被内核放置在的各物理页帧上，
+    /// 从而在地址空间中通过该逻辑段就能访问这些数据。
+    /// 调用它的时候需要满足：切片 data 中的数据大小不超过当前逻辑段的总大小，
+    /// 且切片中的数据会被对齐到逻辑段的开头，然后逐页拷贝到实际的物理页帧。
     pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {
         assert_eq!(self.map_type, MapType::Framed);
         let mut start: usize = 0;
